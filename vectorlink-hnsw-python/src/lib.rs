@@ -1,18 +1,34 @@
+mod queue;
+
+use std::sync::{Arc, LazyLock};
+
 use ::vectorlink_hnsw::{
-    comparator::CosineDistance1536, hnsw, index, layer, params, serialize,
-    util, vectors,
+    comparator::CosineDistance1536,
+    hnsw, index, layer, params, serialize, util,
+    vectors::{self, Vector},
 };
-use arrow::pyarrow::PyArrowType;
+use arrow::{
+    array::{
+        Float32Array, Float32Builder, ListBuilder, RecordBatch, StructBuilder,
+        UInt32Array, UInt32Builder,
+    },
+    datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef},
+    pyarrow::PyArrowType,
+};
 use datafusion::arrow::{
     array::{Array, ArrayData},
     ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream},
 };
 use pyo3::{
     create_exception,
-    exceptions::{PyException, PyIndexError, PyRuntimeError},
+    exceptions::{PyException, PyIndexError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyCapsule,
 };
+
+use rayon::prelude::*;
+
+use queue::OrderedRingQueue;
 
 // This function defines a Python module. Its name MUST match the the `lib.name`
 // settings in `Cargo.toml`, else Python will not be able to import the module.
@@ -31,6 +47,7 @@ fn vectorlink_hnsw(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BuildParams>()?;
     m.add_class::<OptimizationParams>()?;
     m.add_class::<SearchParams>()?;
+    m.add_class::<OrderedRingQueue>()?;
     m.add("SerializeError", m.py().get_type::<SerializeError>())?;
     Ok(())
 }
@@ -236,7 +253,6 @@ impl Layer {
     }
 }
 
-
 #[pyclass(module = "vectorlink_hnsw")]
 pub struct HnswMetadata(serialize::HnswMetadata);
 
@@ -331,6 +347,130 @@ impl Hnsw {
 
     pub fn metadata(&self) -> HnswMetadata {
         HnswMetadata(self.0.metadata())
+    }
+
+    pub fn search_from_initial_with_cosine_1536(
+        &self,
+        vecs: &Vectors,
+        query_vec: PyArrowType<ArrayData>,
+        search_params: SearchParams,
+    ) -> PyResult<PyArrowType<RecordBatch>> {
+        let query_vec = query_vec.0;
+        let search_params = search_params.into_raw();
+        let comparator = CosineDistance1536::new(&vecs.0);
+        if !matches!(query_vec.data_type(), DataType::Float32) {
+            return Err(PyValueError::new_err("query vec is not a float list"));
+        }
+        let query_vec = Float32Array::from(query_vec);
+        if query_vec.len() != 1536 {
+            return Err(PyValueError::new_err("query vec is not length 1536"));
+        }
+
+        let data = query_vec.into_data();
+        let slice = data.buffers().last().unwrap().as_slice();
+        assert_eq!(slice.len(), 1536 * std::mem::size_of::<f32>());
+
+        let result = self.0.search_from_initial(
+            Vector::Slice(slice),
+            &search_params,
+            &comparator,
+        );
+
+        let (ids, distances) = result.into_inner();
+        let ids: Arc<dyn Array> = Arc::new(UInt32Array::from(ids.to_vec()));
+        let distances: Arc<dyn Array> =
+            Arc::new(Float32Array::from(distances.to_vec()));
+
+        static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(Schema::new(vec![
+                Arc::new(Field::new("id", DataType::UInt32, false)),
+                Arc::new(Field::new("distance", DataType::Float32, false)),
+            ]))
+        });
+
+        let result =
+            RecordBatch::try_new(SCHEMA.clone(), vec![ids, distances]).unwrap();
+
+        Ok(result.into())
+    }
+    pub fn knn_with_cosine_1536(
+        &self,
+        vecs: &Vectors,
+        k: usize,
+        search_params: SearchParams,
+    ) -> PyResult<PyArrowType<RecordBatch>> {
+        // TODO - there is an opportunity here to use an arrow stream
+        let search_params = search_params.into_raw();
+        let comparator = CosineDistance1536::new(&vecs.0);
+
+        let result: Vec<_> = self.0.knn(k, search_params, comparator).collect();
+
+        static MATCH_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+            [
+                Arc::new(Field::new("match_id", DataType::UInt32, false)),
+                Arc::new(Field::new(
+                    "match_distance",
+                    DataType::Float32,
+                    false,
+                )),
+            ]
+            .into()
+        });
+
+        static MATCH_LIST_FIELD: LazyLock<FieldRef> = LazyLock::new(|| {
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(MATCH_FIELDS.clone()),
+                false,
+            ))
+        });
+
+        static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(Schema::new(vec![
+                Arc::new(Field::new("id", DataType::UInt32, false)),
+                Arc::new(Field::new(
+                    "matches",
+                    DataType::List(MATCH_LIST_FIELD.clone()),
+                    false,
+                )),
+            ]))
+        });
+        let (ids, matches_list): (Vec<_>, Vec<_>) = result.into_iter().unzip();
+
+        let ids_list: Arc<dyn Array> = Arc::new(UInt32Array::from(ids));
+
+        let mut struct_list_builder =
+            ListBuilder::new(StructBuilder::from_fields(
+                MATCH_FIELDS.clone(),
+                matches_list.len(),
+            ))
+            .with_field(MATCH_LIST_FIELD.clone());
+
+        for matches in matches_list {
+            let struct_builder = struct_list_builder.values();
+            for (match_id, match_distance) in matches {
+                let id_field_builder: &mut UInt32Builder =
+                    struct_builder.field_builder(0).unwrap();
+                id_field_builder.append_value(match_id);
+
+                let distance_field_builder: &mut Float32Builder =
+                    struct_builder.field_builder(1).unwrap();
+                distance_field_builder.append_value(match_distance);
+
+                struct_builder.append(true);
+            }
+
+            struct_list_builder.append(true);
+        }
+
+        let struct_list: Arc<dyn Array> =
+            Arc::new(struct_list_builder.finish());
+
+        let batch =
+            RecordBatch::try_new(SCHEMA.clone(), vec![ids_list, struct_list])
+                .unwrap();
+
+        Ok(batch.into())
     }
 
     pub fn store(&self, dirpath: &str) -> PyResult<()> {

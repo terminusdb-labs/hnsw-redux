@@ -8,6 +8,7 @@ description = "Python bindings for vectorlink-hnsw"
 arrow = { workspace = true }
 datafusion = { workspace = true }
 paste = "1.0.15"
+rayon = "1.10.0"
 tokio-stream = "0.1.17"
 vectorlink-hnsw = { version = "0.1.0", path = "../vectorlink-hnsw" }
 
